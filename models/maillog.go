@@ -1,21 +1,17 @@
 package models
 
 import (
-	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/mail"
-	"net/url"
-	"path"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/gophish/gomail"
+	"github.com/gophish/gophish/config"
 	log "github.com/gophish/gophish/logger"
 	"github.com/gophish/gophish/mailer"
 )
@@ -58,20 +54,16 @@ func GenerateMailLog(c *Campaign, r *Result) error {
 // too many times. Backoff also unlocks the maillog so that it can be processed
 // again in the future.
 func (m *MailLog) Backoff(reason error) error {
-	if m.SendAttempt == MaxSendAttempts {
-		err = m.addError(ErrMaxSendAttempts)
-		return ErrMaxSendAttempts
-	}
 	r, err := GetResult(m.RId)
 	if err != nil {
 		return err
 	}
+	if m.SendAttempt == MaxSendAttempts {
+		r.HandleEmailError(ErrMaxSendAttempts)
+		return ErrMaxSendAttempts
+	}
 	// Add an error, since we had to backoff because of a
 	// temporary error of some sort during the SMTP transaction
-	err = m.addError(reason)
-	if err != nil {
-		return err
-	}
 	m.SendAttempt++
 	backoffDuration := math.Pow(2, float64(m.SendAttempt))
 	m.SendDate = m.SendDate.Add(time.Minute * time.Duration(backoffDuration))
@@ -79,9 +71,7 @@ func (m *MailLog) Backoff(reason error) error {
 	if err != nil {
 		return err
 	}
-	r.Status = STATUS_RETRY
-	r.SendDate = m.SendDate
-	err = db.Save(r).Error
+	err = r.HandleEmailBackoff(reason, m.SendDate)
 	if err != nil {
 		return err
 	}
@@ -101,32 +91,6 @@ func (m *MailLog) Lock() error {
 	return db.Save(&m).Error
 }
 
-// addError adds an error to the associated campaign
-func (m *MailLog) addError(e error) error {
-	c, err := GetCampaign(m.CampaignId, m.UserId)
-	if err != nil {
-		return err
-	}
-	// This is redundant in the case of permanent
-	// errors, but the extra query makes for
-	// a cleaner API.
-	r, err := GetResult(m.RId)
-	if err != nil {
-		return err
-	}
-	es := struct {
-		Error string `json:"error"`
-	}{
-		Error: e.Error(),
-	}
-	ej, err := json.Marshal(es)
-	if err != nil {
-		log.Warn(err)
-	}
-	err = c.AddEvent(Event{Email: r.Email, Message: EVENT_SENDING_ERROR, Details: string(ej)})
-	return err
-}
-
 // Error sets the error status on the models.Result that the
 // maillog refers to. Since MailLog errors are permanent,
 // this action also deletes the maillog.
@@ -136,14 +100,7 @@ func (m *MailLog) Error(e error) error {
 		log.Warn(err)
 		return err
 	}
-	// Update the result
-	err = r.UpdateStatus(ERROR)
-	if err != nil {
-		log.Warn(err)
-		return err
-	}
-	// Update the campaign events
-	err = m.addError(e)
+	err = r.HandleEmailError(e)
 	if err != nil {
 		log.Warn(err)
 		return err
@@ -159,15 +116,7 @@ func (m *MailLog) Success() error {
 	if err != nil {
 		return err
 	}
-	err = r.UpdateStatus(EVENT_SENT)
-	if err != nil {
-		return err
-	}
-	c, err := GetCampaign(m.CampaignId, m.UserId)
-	if err != nil {
-		return err
-	}
-	err = c.AddEvent(Event{Email: r.Email, Message: EVENT_SENT})
+	err = r.HandleEmailSent()
 	if err != nil {
 		return err
 	}
@@ -184,18 +133,6 @@ func (m *MailLog) GetDialer() (mailer.Dialer, error) {
 	return c.SMTP.GetDialer()
 }
 
-// buildTemplate creates a templated string based on the provided
-// template body and data.
-func buildTemplate(text string, data interface{}) (string, error) {
-	buff := bytes.Buffer{}
-	tmpl, err := template.New("template").Parse(text)
-	if err != nil {
-		return buff.String(), err
-	}
-	err = tmpl.Execute(&buff, data)
-	return buff.String(), err
-}
-
 // Generate fills in the details of a gomail.Message instance with
 // the correct headers and body from the campaign and recipient listed in
 // the maillog. We accept the gomail.Message as an argument so that the caller
@@ -209,51 +146,31 @@ func (m *MailLog) Generate(msg *gomail.Message) error {
 	if err != nil {
 		return err
 	}
+
 	f, err := mail.ParseAddress(c.SMTP.FromAddress)
 	if err != nil {
 		return err
 	}
-	fn := f.Name
-	if fn == "" {
-		fn = f.Address
-	}
 	msg.SetAddressHeader("From", f.Address, f.Name)
-	campaignURL, err := buildTemplate(c.URL, r)
+
+	ptx, err := NewPhishingTemplateContext(&c, r.BaseRecipient, r.RId)
 	if err != nil {
 		return err
 	}
 
-	phishURL, _ := url.Parse(campaignURL)
-	q := phishURL.Query()
-	q.Set("rid", r.RId)
-	phishURL.RawQuery = q.Encode()
-
-	trackingURL, _ := url.Parse(campaignURL)
-	trackingURL.Path = path.Join(trackingURL.Path, "/track")
-	trackingURL.RawQuery = q.Encode()
-
-	td := struct {
-		Result
-		URL         string
-		TrackingURL string
-		Tracker     string
-		From        string
-	}{
-		r,
-		phishURL.String(),
-		trackingURL.String(),
-		"<img alt='' style='display: none' src='" + trackingURL.String() + "'/>",
-		fn,
+	// Add the transparency headers
+	msg.SetHeader("X-Mailer", config.ServerName)
+	if config.Conf.ContactAddress != "" {
+		msg.SetHeader("X-Gophish-Contact", config.Conf.ContactAddress)
 	}
-
 	// Parse the customHeader templates
 	for _, header := range c.SMTP.Headers {
-		key, err := buildTemplate(header.Key, td)
+		key, err := ExecuteTemplate(header.Key, ptx)
 		if err != nil {
 			log.Warn(err)
 		}
 
-		value, err := buildTemplate(header.Value, td)
+		value, err := ExecuteTemplate(header.Value, ptx)
 		if err != nil {
 			log.Warn(err)
 		}
@@ -263,7 +180,7 @@ func (m *MailLog) Generate(msg *gomail.Message) error {
 	}
 
 	// Parse remaining templates
-	subject, err := buildTemplate(c.Template.Subject, td)
+	subject, err := ExecuteTemplate(c.Template.Subject, ptx)
 	if err != nil {
 		log.Warn(err)
 	}
@@ -274,14 +191,14 @@ func (m *MailLog) Generate(msg *gomail.Message) error {
 
 	msg.SetHeader("To", r.FormatAddress())
 	if c.Template.Text != "" {
-		text, err := buildTemplate(c.Template.Text, td)
+		text, err := ExecuteTemplate(c.Template.Text, ptx)
 		if err != nil {
 			log.Warn(err)
 		}
 		msg.SetBody("text/plain", text)
 	}
 	if c.Template.HTML != "" {
-		html, err := buildTemplate(c.Template.HTML, td)
+		html, err := ExecuteTemplate(c.Template.HTML, ptx)
 		if err != nil {
 			log.Warn(err)
 		}
